@@ -1,0 +1,205 @@
+# MediCore HR — the whole stack, for local dev or a VPS, in one file.
+#
+# Both service Dockerfiles are inlined via `build.dockerfile_inline`.
+# Nothing else needs to exist on the server except this file, a `.env` next
+# to it (copy `.env.prod.example`), and the repo checkout itself.
+#
+# Layout: no reverse proxy is bundled in this stack — api and web each
+# EXPOSE port 3000 and are meant to be fronted directly by whatever
+# platform proxy is already running on the host (Coolify's built-in
+# Traefik does exactly this: assign each service its own domain in the
+# Coolify UI and it handles TLS + routing for you, no ports: needed here).
+# Deploying with plain `docker compose` on a bare VPS instead? Uncomment
+# the `ports:` lines below on api/web and put your own reverse proxy (or
+# just a DNS A record straight at the host) in front of them. Either way
+# the two are separate origins — the API talks to the browser via CORS +
+# a Bearer access/refresh token pair, no cookie crosses the app/api
+# boundary. Postgres is not reachable from outside the compose network
+# at all.
+#
+# First deploy:
+#   cp .env.prod.example .env   # then fill in real secrets
+#   docker compose up -d --build
+
+name: medicore-hr
+
+# Docker's default json-file log driver has no size cap — left alone, a
+# long-running container's logs grow unbounded and can fill the VPS's disk
+# over months. Cap every service the same way: 10MB x 3 rotated files.
+x-logging: &default-logging
+  driver: json-file
+  options:
+    max-size: '10m'
+    max-file: '3'
+
+networks:
+  medicore:
+    driver: bridge
+
+volumes:
+  pgdata:
+  uploads:
+
+services:
+  db:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    logging: *default-logging
+    networks: [medicore]
+    environment:
+      # USER/DB are just names, not secrets — safe to default. PASSWORD has
+      # no default on purpose: the official postgres image refuses to start
+      # at all (not just unhealthy — it exits immediately) if this is blank,
+      # which is exactly what happened on the first two Coolify deploys
+      # before POSTGRES_PASSWORD was set in its Environment Variables tab.
+      # This is a *database* name — don't confuse it with the app's Postgres
+      # *schema* (medicore_hr_db, hardcoded in apps/api/src/db/schema.ts and
+      # created automatically by the first migration) — different concept,
+      # lives inside whichever database POSTGRES_DB names.
+      POSTGRES_USER: ${POSTGRES_USER:-medicore}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_DB: ${POSTGRES_DB:-medicore_hr}
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    # No ports: published — only reachable from other containers on the
+    # `medicore` network. Back it up with `docker compose exec db pg_dump ...`.
+    healthcheck:
+      test: ['CMD-SHELL', 'pg_isready -U ${POSTGRES_USER:-medicore} -d ${POSTGRES_DB:-medicore_hr}']
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+    deploy:
+      resources:
+        limits:
+          cpus: '1'
+          memory: 512M
+
+  api:
+    restart: unless-stopped
+    logging: *default-logging
+    networks: [medicore]
+    build:
+      context: .
+      dockerfile_inline: |
+        # ---- deps: install once, cached until package.json/bun.lock change ----
+        FROM oven/bun:1-alpine AS deps
+        WORKDIR /app
+        COPY package.json bun.lock ./
+        COPY apps/api/package.json ./apps/api/package.json
+        COPY apps/web/package.json ./apps/web/package.json
+        RUN bun install --frozen-lockfile
+
+        # ---- runtime ----
+        FROM oven/bun:1-alpine
+        WORKDIR /app
+        COPY apps/api ./apps/api
+        COPY --from=deps /app/package.json ./package.json
+        # Bun's workspace install hoists shared deps to the root node_modules
+        # but also writes a workspace-local node_modules (with that
+        # workspace's own .bin symlinks) — both are needed at runtime.
+        COPY --from=deps /app/node_modules ./node_modules
+        COPY --from=deps /app/apps/api/node_modules ./apps/api/node_modules
+        ENV NODE_ENV=production
+        EXPOSE 3000
+        HEALTHCHECK --interval=15s --timeout=5s --retries=5 --start-period=10s \
+          CMD bun -e "fetch('http://localhost:3000/api/health').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"
+        CMD ["bun", "apps/api/src/index.ts"]
+    environment:
+      NODE_ENV: production
+      PORT: 3000
+      HOST: 0.0.0.0
+      DATABASE_URL: postgres://${POSTGRES_USER:-medicore}:${POSTGRES_PASSWORD}@db:5432/${POSTGRES_DB:-medicore_hr}
+      JWT_SECRET: ${JWT_SECRET}
+      ENCRYPTION_KEY: ${ENCRYPTION_KEY}
+      # Only origin allowed to call the API from a browser — the web app's
+      # own public URL (set this to whatever domain Coolify assigned/you
+      # attached to the `web` service). Comma-separate if there's more than
+      # one trusted frontend (e.g. a staging app domain too).
+      CORS_ORIGIN: ${PUBLIC_APP_URL}
+      # Bearer access token lifetime — short by design (see apps/api/src/auth.ts).
+      JWT_ACCESS_EXPIRES_IN: ${JWT_ACCESS_EXPIRES_IN:-15m}
+      # Refresh token / hard session cap — a signed-out-everywhere point even
+      # if the client silently refreshes forever within it.
+      JWT_REFRESH_EXPIRES_IN: ${JWT_REFRESH_EXPIRES_IN:-8h}
+      # Auto-migrate/seed is only safe (and only needed) on the very first
+      # boot against a fresh database — flip to "false" after that in .env.
+      AUTO_MIGRATE: ${AUTO_MIGRATE:-true}
+      FILE_BUCKET_DIR: /app/data/uploads
+    volumes:
+      - uploads:/app/data/uploads
+    # Uncomment for a standalone (non-Coolify) VPS deploy — Coolify's own
+    # proxy reaches this container over the `medicore` network via EXPOSE
+    # 3000 above and needs no published host port.
+    # ports:
+    #   - '3000:3000'
+    depends_on:
+      db:
+        condition: service_healthy
+    deploy:
+      resources:
+        limits:
+          cpus: '1'
+          memory: 512M
+
+  web:
+    restart: unless-stopped
+    logging: *default-logging
+    networks: [medicore]
+    build:
+      context: .
+      dockerfile_inline: |
+        # ---- deps ----
+        FROM oven/bun:1-alpine AS deps
+        WORKDIR /app
+        COPY package.json bun.lock ./
+        COPY apps/api/package.json ./apps/api/package.json
+        COPY apps/web/package.json ./apps/web/package.json
+        RUN bun install --frozen-lockfile
+
+        # ---- build: adapter-node output (build/index.js), run directly by Bun ----
+        FROM oven/bun:1-alpine AS build
+        WORKDIR /app
+        COPY apps/web ./apps/web
+        COPY --from=deps /app/package.json ./package.json
+        # Bun's workspace install hoists shared deps to the root node_modules
+        # but also writes a workspace-local node_modules (with that
+        # workspace's own .bin symlinks, e.g. vite) — both are needed here.
+        COPY --from=deps /app/node_modules ./node_modules
+        COPY --from=deps /app/apps/web/node_modules ./apps/web/node_modules
+        WORKDIR /app/apps/web
+        RUN bun run build
+
+        # ---- runtime ----
+        FROM oven/bun:1-alpine
+        WORKDIR /app
+        COPY --from=build /app/node_modules ./node_modules
+        COPY --from=build /app/apps/web/node_modules ./apps/web/node_modules
+        COPY --from=build /app/apps/web/build ./build
+        ENV NODE_ENV=production
+        EXPOSE 3000
+        HEALTHCHECK --interval=15s --timeout=5s --retries=5 --start-period=10s \
+          CMD bun -e "fetch('http://localhost:3000/login').then(r=>process.exit(r.status<500?0:1)).catch(()=>process.exit(1))"
+        CMD ["bun", "build/index.js"]
+    environment:
+      NODE_ENV: production
+      PORT: 3000
+      HOST: 0.0.0.0
+      # Used by adapter-node for absolute-URL resolution behind whatever
+      # proxy fronts this container (Coolify's, or your own).
+      ORIGIN: ${PUBLIC_APP_URL}
+      # Read at runtime by $env/dynamic/public (apps/web/src/lib/apiBase.ts)
+      # so every browser fetch targets the API's own domain instead of a
+      # relative path — the two are no longer the same origin.
+      PUBLIC_API_URL: ${PUBLIC_API_URL}
+    # Uncomment for a standalone (non-Coolify) VPS deploy.
+    # ports:
+    #   - '5173:3000'
+    depends_on:
+      api:
+        condition: service_healthy
+    deploy:
+      resources:
+        limits:
+          cpus: '1'
+          memory: 512M

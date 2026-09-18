@@ -1,0 +1,12 @@
+node_modules
+**/node_modules
+.svelte-kit
+apps/web/build
+apps/web/.svelte-kit
+apps/api/HR-EMP-FILE
+.git
+.gitignore
+*.md
+.env
+.env.*
+!.env.*.example

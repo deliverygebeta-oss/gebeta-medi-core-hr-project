@@ -1,0 +1,29 @@
+# Dependencies
+node_modules
+**/node_modules
+
+# Build output
+apps/web/build
+apps/web/.svelte-kit
+.svelte-kit
+
+# Environment secrets
+.env
+.env.*
+!.env.example
+!.env.*.example
+!.env.test
+
+# Uploaded employee documents (PII) - never committed
+apps/api/HR-EMP-FILE
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+
+# Vite
+vite.config.js.timestamp-*
+vite.config.ts.timestamp-*

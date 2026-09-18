@@ -1,0 +1,26 @@
+{
+  "name": "@medicore/api",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "bun --hot src/index.ts",
+    "start": "bun src/index.ts",
+    "db:generate": "drizzle-kit generate",
+    "db:migrate": "drizzle-kit migrate",
+    "db:seed": "bun src/db/seed.ts",
+    "db:backfill-encrypt": "bun src/db/backfill-encrypt.ts",
+    "db:backfill-national-id-hash": "bun src/db/backfill-national-id-hash.ts",
+    "db:studio": "drizzle-kit studio",
+    "test": "bun test"
+  },
+  "dependencies": {
+    "drizzle-orm": "^0.44.2",
+    "hono": "^4.8.3",
+    "postgres": "^3.4.7",
+    "zod": "^3.25.67"
+  },
+  "devDependencies": {
+    "drizzle-kit": "^0.31.4",
+    "@types/bun": "latest"
+  }
+}
